@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -26,6 +27,7 @@ TEMPERATURE = 0.6
 TOP_P = 0.9
 REPETITION_PENALTY = 1.1
 SAMPLE_RATE = 24000  # SNAC model uses 24kHz
+DEFAULT_CHUNK_SIZE = 300  # Default chunk size for long texts
 
 # Available voices based on the Orpheus-TTS repository
 AVAILABLE_VOICES = ["tara", "leah", "jess", "leo", "dan", "mia", "zac", "zoe"]
@@ -246,19 +248,68 @@ def generate_speech_from_api(
     top_p=TOP_P,
     max_tokens=MAX_TOKENS,
     repetition_penalty=REPETITION_PENALTY,
+    chunk_size=DEFAULT_CHUNK_SIZE,
 ):
     """Generate speech from text using Orpheus model via LM Studio API."""
-    return tokens_decoder_sync(
-        generate_tokens_from_api(
-            prompt=prompt,
-            voice=voice,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-            repetition_penalty=repetition_penalty,
-        ),
-        output_file=output_file,
-    )
+    # Split text into chunks if it's too long
+    chunks = split_text_into_chunks(prompt, chunk_size)
+
+    if len(chunks) == 1:
+        # Single chunk - use original method
+        return tokens_decoder_sync(
+            generate_tokens_from_api(
+                prompt=prompt,
+                voice=voice,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                repetition_penalty=repetition_penalty,
+            ),
+            output_file=output_file,
+        )
+    else:
+        # Multiple chunks - process each and merge audio
+        print(f"Processing text in {len(chunks)} chunks...")
+        all_audio_segments = []
+
+        for i, chunk in enumerate(chunks, 1):
+            print(f"Processing chunk {i}/{len(chunks)}...")
+
+            # Generate audio for this chunk (don't write to file yet)
+            chunk_audio_segments = tokens_decoder_sync(
+                generate_tokens_from_api(
+                    prompt=chunk,
+                    voice=voice,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                    repetition_penalty=repetition_penalty,
+                ),
+                output_file=None,  # Don't write individual chunks to file
+            )
+
+            all_audio_segments.extend(chunk_audio_segments)
+
+        # Write merged audio to output file if specified
+        if output_file:
+            print(f"Merging audio and saving to {output_file}...")
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
+
+            with wave.open(output_file, "wb") as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(SAMPLE_RATE)
+
+                for segment in all_audio_segments:
+                    wav_file.writeframes(segment)
+
+        # Calculate and print total duration
+        total_duration = sum([len(segment) // (2 * 1) for segment in all_audio_segments]) / SAMPLE_RATE
+        print(f"Generated {len(all_audio_segments)} total audio segments")
+        print(f"Generated {total_duration:.2f} seconds of audio")
+
+        return all_audio_segments
 
 
 def read_text_from_file(file_path):
@@ -319,6 +370,57 @@ def get_reddit_post_content(reddit_url):
         return None
 
 
+def split_text_into_chunks(text, chunk_size=DEFAULT_CHUNK_SIZE):
+    """Split long text into smaller chunks at sentence boundaries."""
+    if len(text) <= chunk_size:
+        return [text]
+
+    chunks = []
+    current_chunk = ""
+
+    # Split into sentences using regex
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+
+    for sentence in sentences:
+        # If adding this sentence would exceed chunk size, start a new chunk
+        if current_chunk and len(current_chunk + " " + sentence) > chunk_size:
+            if current_chunk:  # Don't add empty chunks
+                chunks.append(current_chunk.strip())
+            current_chunk = sentence
+        else:
+            if current_chunk:
+                current_chunk += " " + sentence
+            else:
+                current_chunk = sentence
+
+    # Add the last chunk if it's not empty
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    # Handle case where a single sentence is longer than chunk_size
+    final_chunks = []
+    for chunk in chunks:
+        if len(chunk) <= chunk_size:
+            final_chunks.append(chunk)
+        else:
+            # Split long sentences by words
+            words = chunk.split()
+            current_word_chunk = ""
+            for word in words:
+                if current_word_chunk and len(current_word_chunk + " " + word) > chunk_size:
+                    final_chunks.append(current_word_chunk.strip())
+                    current_word_chunk = word
+                else:
+                    if current_word_chunk:
+                        current_word_chunk += " " + word
+                    else:
+                        current_word_chunk = word
+            if current_word_chunk:
+                final_chunks.append(current_word_chunk.strip())
+
+    return final_chunks
+
+
 def list_available_voices():
     """List all available voices with the recommended one marked."""
     print("Available voices (in order of conversational realism):")
@@ -363,6 +465,12 @@ def main():
         type=float,
         default=REPETITION_PENALTY,
         help="Repetition penalty (>=1.1 required for stable generation)",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE,
+        help=f"Chunk size for processing long texts (default: {DEFAULT_CHUNK_SIZE})",
     )
 
     args = parser.parse_args()
@@ -427,6 +535,7 @@ def main():
         temperature=args.temperature,
         top_p=args.top_p,
         repetition_penalty=args.repetition_penalty,
+        chunk_size=getattr(args, 'chunk_size', DEFAULT_CHUNK_SIZE),
         output_file=output_file,
     )
     end_time = time.time()
