@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 import wave
-from typing import Optional
+from typing import AsyncGenerator, Generator, List, Optional, Tuple, Union
 
 import numpy as np
 import requests
@@ -16,19 +16,21 @@ import sounddevice as sd
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from decoder import convert_to_audio
 from shortform_replacements import post_process_text
 
 
 def format_text_for_cache(text: str) -> str:
     """Format text with sentences on separate lines and empty lines between them."""
     # Split text into sentences using regex
-    sentences = re.split(r'(?<=[.!?])\s+', text)
+    sentences = re.split(r"(?<=[.!?])\s+", text)
 
     # Filter out empty sentences and strip whitespace
     sentences = [sentence.strip() for sentence in sentences if sentence.strip()]
 
     # Join sentences with double newlines (empty line between them)
-    return '\n\n'.join(sentences)
+    return "\n\n".join(sentences)
+
 
 # Load environment variables from .env file
 load_dotenv()
@@ -108,7 +110,7 @@ def format_prompt(prompt: str, voice: str = DEFAULT_VOICE) -> str:
 def generate_tokens_from_api(
     prompt: str,
     voice: str = DEFAULT_VOICE,
-):
+) -> Generator[str, None, None]:
     """Generate tokens from text using OpenAI SDK streaming."""
     formatted_prompt = format_prompt(prompt, voice)
     print(f"Generating speech for: {formatted_prompt}")
@@ -141,7 +143,7 @@ def generate_tokens_from_api(
         return
 
 
-def turn_token_into_id(token_string: str, index: int):
+def turn_token_into_id(token_string: str, index: int) -> Optional[int]:
     """Convert token string to numeric ID for audio processing."""
     # Strip whitespace
     token_string = token_string.strip()
@@ -167,17 +169,11 @@ def turn_token_into_id(token_string: str, index: int):
         return None
 
 
-def convert_to_audio(multiframe):
-    """Convert token frames to audio."""
-    # Import here to avoid circular imports
-    from decoder import convert_to_audio as orpheus_convert_to_audio
-
-    return orpheus_convert_to_audio(multiframe)
-
-
-async def tokens_decoder(token_gen):
+async def tokens_decoder(
+    token_gen: AsyncGenerator[str, None],
+) -> AsyncGenerator[bytes, None]:
     """Asynchronous token decoder that converts token stream to audio stream."""
-    buffer = []
+    buffer: List[int] = []
     count = 0
     async for token_text in token_gen:
         token = turn_token_into_id(token_text, count)
@@ -193,10 +189,12 @@ async def tokens_decoder(token_gen):
                     yield audio_samples
 
 
-def tokens_decoder_sync(syn_token_gen, output_file=None):
+def tokens_decoder_sync(
+    syn_token_gen: Generator[str, None, None], output_file: Optional[str] = None
+) -> List[bytes]:
     """Synchronous wrapper for the asynchronous token decoder."""
-    audio_queue = queue.Queue()
-    audio_segments = []
+    audio_queue: queue.Queue[Optional[bytes]] = queue.Queue()
+    audio_segments: List[bytes] = []
 
     # If output_file is provided, prepare WAV file
     wav_file = None
@@ -253,9 +251,9 @@ def tokens_decoder_sync(syn_token_gen, output_file=None):
     return audio_segments
 
 
-def stream_audio(audio_buffer):
+def stream_audio(audio_buffer: bytes) -> None:
     """Stream audio buffer to output device."""
-    if audio_buffer is None or len(audio_buffer) == 0:
+    if len(audio_buffer) == 0:
         return
 
     # Convert bytes to NumPy array (16-bit PCM)
@@ -274,10 +272,10 @@ def generate_speech_from_api(
     voice: str = DEFAULT_VOICE,
     output_file: Optional[str] = None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
-):
+) -> List[bytes]:
     """Generate speech from text using Orpheus model via LM Studio API."""
     # Split text into chunks if it's too long
-    chunks = split_text_into_chunks(prompt, chunk_size)
+    chunks: List[str] = split_text_into_chunks(prompt, chunk_size)
 
     if len(chunks) == 1:
         # Single chunk - use original method
@@ -291,13 +289,13 @@ def generate_speech_from_api(
     else:
         # Multiple chunks - process each and merge audio
         print(f"Processing text in {len(chunks)} chunks...")
-        all_audio_segments = []
+        all_audio_segments: List[bytes] = []
 
         for i, chunk in enumerate(chunks, 1):
             print(f"Processing chunk {i}/{len(chunks)}...")
 
             # Generate audio for this chunk (don't write to file yet)
-            chunk_audio_segments = tokens_decoder_sync(
+            chunk_audio_segments: List[bytes] = tokens_decoder_sync(
                 generate_tokens_from_api(
                     prompt=chunk,
                     voice=voice,
@@ -345,7 +343,7 @@ def read_text_from_file(file_path: str) -> Optional[str]:
         return None
 
 
-def get_reddit_post_content(reddit_url: str):
+def get_reddit_post_content(reddit_url: str) -> Tuple[Optional[str], Optional[str]]:
     """Extract title and content from a Reddit post URL and cache it."""
     try:
         # Extract post ID from URL
@@ -499,7 +497,9 @@ def preprocess_text(
 
             return final_processed_text
         else:
-            print("Warning: Empty response from preprocessing, applying fallback hardcoded replacements")
+            print(
+                "Warning: Empty response from preprocessing, applying fallback hardcoded replacements"
+            )
             # Apply hardcoded replacements as fallback
             fallback_processed_text = post_process_text(text)
 
@@ -509,11 +509,15 @@ def preprocess_text(
 
             if cache_key:
                 original_file = os.path.join(cache_dir, f"{cache_key}_original.txt")
-                processed_file = os.path.join(cache_dir, f"{cache_key}_processed_fallback.txt")
+                processed_file = os.path.join(
+                    cache_dir, f"{cache_key}_processed_fallback.txt"
+                )
             else:
                 timestamp = time.strftime("%Y%m%d_%H%M%S")
                 original_file = os.path.join(cache_dir, f"{timestamp}_original.txt")
-                processed_file = os.path.join(cache_dir, f"{timestamp}_processed_fallback.txt")
+                processed_file = os.path.join(
+                    cache_dir, f"{timestamp}_processed_fallback.txt"
+                )
 
             try:
                 if not os.path.exists(original_file):
@@ -541,11 +545,15 @@ def preprocess_text(
 
         if cache_key:
             original_file = os.path.join(cache_dir, f"{cache_key}_original.txt")
-            processed_file = os.path.join(cache_dir, f"{cache_key}_processed_fallback.txt")
+            processed_file = os.path.join(
+                cache_dir, f"{cache_key}_processed_fallback.txt"
+            )
         else:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             original_file = os.path.join(cache_dir, f"{timestamp}_original.txt")
-            processed_file = os.path.join(cache_dir, f"{timestamp}_processed_fallback.txt")
+            processed_file = os.path.join(
+                cache_dir, f"{timestamp}_processed_fallback.txt"
+            )
 
         try:
             if not os.path.exists(original_file):
@@ -569,8 +577,8 @@ def split_text_into_chunks(
     if len(text) <= chunk_size:
         return [text]
 
-    chunks: list[str] = []
-    current_chunk = ""
+    chunks: List[str] = []
+    current_chunk: str = ""
 
     # Split into sentences using regex
     sentences = re.split(r"(?<=[.!?])\s+", text)
@@ -592,14 +600,14 @@ def split_text_into_chunks(
         chunks.append(current_chunk.strip())
 
     # Handle case where a single sentence is longer than chunk_size
-    final_chunks: list[str] = []
+    final_chunks: List[str] = []
     for chunk in chunks:
         if len(chunk) <= chunk_size:
             final_chunks.append(chunk)
         else:
             # Split long sentences by words
             words = chunk.split()
-            current_word_chunk = ""
+            current_word_chunk: str = ""
             for word in words:
                 if (
                     current_word_chunk
@@ -618,7 +626,7 @@ def split_text_into_chunks(
     return final_chunks
 
 
-def list_available_voices():
+def list_available_voices() -> None:
     """List all available voices with the recommended one marked."""
     print("Available voices (in order of conversational realism):")
     for voice in AVAILABLE_VOICES:
@@ -630,7 +638,7 @@ def list_available_voices():
     print("<laugh>, <chuckle>, <sigh>, <cough>, <sniffle>, <groan>, <yawn>, <gasp>")
 
 
-def main():
+def main() -> None:
     # Parse command line arguments
     parser = argparse.ArgumentParser(
         description="Orpheus Text-to-Speech using LM Studio API"

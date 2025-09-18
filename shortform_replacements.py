@@ -4,7 +4,7 @@ This module provides a fallback for catching shortforms that may be missed by LL
 """
 
 import re
-from typing import Dict
+from typing import Dict, Match
 
 # Dictionary of shortform to longform replacements
 # Based on examples from the preprocessing system prompt
@@ -141,7 +141,7 @@ def replace_shortforms(text: str, case_sensitive: bool = False) -> str:
             # Case-insensitive replacement while preserving the case of the first letter
             pattern = r'\b' + re.escape(shortform) + r'\b'
 
-            def replace_match(match):
+            def replace_match(match: Match[str]) -> str:
                 original = match.group(0)
                 # If the original starts with uppercase, capitalize the replacement
                 if original[0].isupper():

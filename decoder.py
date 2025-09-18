@@ -1,6 +1,7 @@
 import asyncio
 import queue
 import threading
+from typing import AsyncGenerator, Generator, List, Optional
 
 import numpy as np
 import torch
@@ -20,7 +21,7 @@ print(f"Using device: {snac_device}")
 model = model.to(snac_device)
 
 
-def convert_to_audio(multiframe):
+def convert_to_audio(multiframe: List[int]) -> Optional[bytes]:
     if len(multiframe) < 7:
         return
 
@@ -138,7 +139,7 @@ def convert_to_audio(multiframe):
     return audio_bytes
 
 
-def turn_token_into_id(token_string, index):
+def turn_token_into_id(token_string: str, index: int) -> Optional[int]:
     # Strip whitespace
     token_string = token_string.strip()
 
@@ -163,8 +164,8 @@ def turn_token_into_id(token_string, index):
         return None
 
 
-async def tokens_decoder(token_gen):
-    buffer = []
+async def tokens_decoder(token_gen: AsyncGenerator[str, None]) -> AsyncGenerator[bytes, None]:
+    buffer: List[int] = []
     count = 0
     async for token_sim in token_gen:
         token = turn_token_into_id(token_sim, count)
@@ -177,13 +178,13 @@ async def tokens_decoder(token_gen):
 
                 if count % 7 == 0 and count > 27:
                     buffer_to_proc = buffer[-28:]
-                    audio_samples = convert_to_audio(buffer_to_proc, count)
+                    audio_samples = convert_to_audio(buffer_to_proc)
                     if audio_samples is not None:
                         yield audio_samples
 
 
 # ------------------ Synchronous Tokens Decoder Wrapper ------------------ #
-def tokens_decoder_sync(syn_token_gen):
+def tokens_decoder_sync(syn_token_gen: Generator[str, None, None]) -> Generator[bytes, None, None]:
     audio_queue = queue.Queue()
 
     # Convert the synchronous token generator into an async generator.
