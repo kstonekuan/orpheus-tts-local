@@ -8,24 +8,40 @@ import sys
 import threading
 import time
 import wave
+from typing import Optional
 
 import numpy as np
 import requests
 import sounddevice as sd
 from dotenv import load_dotenv
+from openai import OpenAI
+
+from shortform_replacements import post_process_text
+
+
+def format_text_for_cache(text: str) -> str:
+    """Format text with sentences on separate lines and empty lines between them."""
+    # Split text into sentences using regex
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+
+    # Filter out empty sentences and strip whitespace
+    sentences = [sentence.strip() for sentence in sentences if sentence.strip()]
+
+    # Join sentences with double newlines (empty line between them)
+    return '\n\n'.join(sentences)
 
 # Load environment variables from .env file
 load_dotenv()
 
 # LM Studio API settings
-API_URL = os.getenv("API_URL", "http://127.0.0.1:1234/v1/completions")
+API_URL = os.getenv("API_URL", "http://127.0.0.1:1234/v1")
 HEADERS = {"Content-Type": "application/json"}
 
+# Preprocessing LLM settings
+PREPROCESSING_MODEL = os.getenv("PREPROCESSING_MODEL", "openai/gpt-oss-20b")
+ENABLE_PREPROCESSING = os.getenv("ENABLE_PREPROCESSING", "true").lower() == "true"
+
 # Model parameters
-MAX_TOKENS = 1200
-TEMPERATURE = 0.6
-TOP_P = 0.9
-REPETITION_PENALTY = 1.1
 SAMPLE_RATE = 24000  # SNAC model uses 24kHz
 DEFAULT_CHUNK_SIZE = 300  # Default chunk size for long texts
 
@@ -38,8 +54,40 @@ START_TOKEN_ID = 128259
 END_TOKEN_IDS = [128009, 128260, 128261, 128257]
 CUSTOM_TOKEN_PREFIX = "<custom_token_"
 
+PREPROCESSING_SYSTEM_PROMPT = """You are pre-processing a story meant to be read out loud.
+Expand common shortforms to their full phrase for reading.
+Censor profanities by replacing them with just the first letter.
 
-def format_prompt(prompt, voice=DEFAULT_VOICE):
+You can add emotion to the speech by adding the following tags:
+```xml
+<giggle>
+<laugh>
+<chuckle>
+<sigh>
+<cough>
+<sniffle>
+<groan>
+<yawn>
+<gasp>
+```
+
+DO NOT change any other words, sentence structure, or the meaning of the text.
+Return only the modified text without any additional commentary.
+
+Examples (not an exhaustive list):
+tbh -> to be honest
+idk -> I don't know
+rly -> really
+ppl -> people
+u -> you
+SIL -> sister in law
+AITA -> Am I The A
+AH -> A Hole
+wtf -> what the F
+"""
+
+
+def format_prompt(prompt: str, voice: str = DEFAULT_VOICE) -> str:
     """Format prompt for Orpheus model with voice prefix and special tokens."""
     if voice not in AVAILABLE_VOICES:
         print(
@@ -58,61 +106,42 @@ def format_prompt(prompt, voice=DEFAULT_VOICE):
 
 
 def generate_tokens_from_api(
-    prompt,
-    voice=DEFAULT_VOICE,
-    temperature=TEMPERATURE,
-    top_p=TOP_P,
-    max_tokens=MAX_TOKENS,
-    repetition_penalty=REPETITION_PENALTY,
+    prompt: str,
+    voice: str = DEFAULT_VOICE,
 ):
-    """Generate tokens from text using LM Studio API."""
+    """Generate tokens from text using OpenAI SDK streaming."""
     formatted_prompt = format_prompt(prompt, voice)
     print(f"Generating speech for: {formatted_prompt}")
 
-    # Create the request payload for the LM Studio API
-    payload = {
-        "model": "orpheus-3b-0.1-ft-q4_k_m",  # Model name can be anything, LM Studio ignores it
-        "prompt": formatted_prompt,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
-        "repeat_penalty": repetition_penalty,
-        "stream": True,
-    }
+    try:
+        # Initialize OpenAI client
+        client = OpenAI(
+            base_url=API_URL,
+            api_key="not-needed",  # LM Studio doesn't require real API key
+        )
 
-    # Make the API request with streaming
-    response = requests.post(API_URL, headers=HEADERS, json=payload, stream=True)
+        # Create streaming completion
+        stream = client.completions.create(
+            model="orpheus-3b-0.1-ft",
+            prompt=formatted_prompt,
+            stream=True,  # Enable streaming
+        )
 
-    if response.status_code != 200:
-        print(f"Error: API request failed with status code {response.status_code}")
-        print(f"Error details: {response.text}")
+        # Process the stream
+        token_counter = 0
+        for chunk in stream:
+            if chunk.choices[0].text:
+                token_counter += 1
+                yield chunk.choices[0].text
+
+        print("Token generation complete")
+
+    except Exception as e:
+        print(f"Error: Token generation failed with error: {e}")
         return
 
-    # Process the streamed response
-    token_counter = 0
-    for line in response.iter_lines():
-        if line:
-            line = line.decode("utf-8")
-            if line.startswith("data: "):
-                data_str = line[6:]  # Remove the 'data: ' prefix
-                if data_str.strip() == "[DONE]":
-                    break
 
-                try:
-                    data = json.loads(data_str)
-                    if "choices" in data and len(data["choices"]) > 0:
-                        token_text = data["choices"][0].get("text", "")
-                        token_counter += 1
-                        if token_text:
-                            yield token_text
-                except json.JSONDecodeError as e:
-                    print(f"Error decoding JSON: {e}")
-                    continue
-
-    print("Token generation complete")
-
-
-def turn_token_into_id(token_string, index):
+def turn_token_into_id(token_string: str, index: int):
     """Convert token string to numeric ID for audio processing."""
     # Strip whitespace
     token_string = token_string.strip()
@@ -138,12 +167,12 @@ def turn_token_into_id(token_string, index):
         return None
 
 
-def convert_to_audio(multiframe, count):
+def convert_to_audio(multiframe):
     """Convert token frames to audio."""
     # Import here to avoid circular imports
     from decoder import convert_to_audio as orpheus_convert_to_audio
 
-    return orpheus_convert_to_audio(multiframe, count)
+    return orpheus_convert_to_audio(multiframe)
 
 
 async def tokens_decoder(token_gen):
@@ -159,7 +188,7 @@ async def tokens_decoder(token_gen):
             # Convert to audio when we have enough tokens
             if count % 7 == 0 and count > 27:
                 buffer_to_proc = buffer[-28:]
-                audio_samples = convert_to_audio(buffer_to_proc, count)
+                audio_samples = convert_to_audio(buffer_to_proc)
                 if audio_samples is not None:
                     yield audio_samples
 
@@ -241,14 +270,10 @@ def stream_audio(audio_buffer):
 
 
 def generate_speech_from_api(
-    prompt,
-    voice=DEFAULT_VOICE,
-    output_file=None,
-    temperature=TEMPERATURE,
-    top_p=TOP_P,
-    max_tokens=MAX_TOKENS,
-    repetition_penalty=REPETITION_PENALTY,
-    chunk_size=DEFAULT_CHUNK_SIZE,
+    prompt: str,
+    voice: str = DEFAULT_VOICE,
+    output_file: Optional[str] = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
 ):
     """Generate speech from text using Orpheus model via LM Studio API."""
     # Split text into chunks if it's too long
@@ -260,10 +285,6 @@ def generate_speech_from_api(
             generate_tokens_from_api(
                 prompt=prompt,
                 voice=voice,
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens,
-                repetition_penalty=repetition_penalty,
             ),
             output_file=output_file,
         )
@@ -280,10 +301,6 @@ def generate_speech_from_api(
                 generate_tokens_from_api(
                     prompt=chunk,
                     voice=voice,
-                    temperature=temperature,
-                    top_p=top_p,
-                    max_tokens=max_tokens,
-                    repetition_penalty=repetition_penalty,
                 ),
                 output_file=None,  # Don't write individual chunks to file
             )
@@ -305,17 +322,20 @@ def generate_speech_from_api(
                     wav_file.writeframes(segment)
 
         # Calculate and print total duration
-        total_duration = sum([len(segment) // (2 * 1) for segment in all_audio_segments]) / SAMPLE_RATE
+        total_duration = (
+            sum([len(segment) // (2 * 1) for segment in all_audio_segments])
+            / SAMPLE_RATE
+        )
         print(f"Generated {len(all_audio_segments)} total audio segments")
         print(f"Generated {total_duration:.2f} seconds of audio")
 
         return all_audio_segments
 
 
-def read_text_from_file(file_path):
+def read_text_from_file(file_path: str) -> Optional[str]:
     """Read text content from a file."""
     try:
-        with open(file_path, 'r', encoding='utf-8') as file:
+        with open(file_path, "r", encoding="utf-8") as file:
             return file.read().strip()
     except FileNotFoundError:
         print(f"Error: File '{file_path}' not found.")
@@ -325,61 +345,235 @@ def read_text_from_file(file_path):
         return None
 
 
-def get_reddit_post_content(reddit_url):
-    """Extract title and content from a Reddit post URL."""
+def get_reddit_post_content(reddit_url: str):
+    """Extract title and content from a Reddit post URL and cache it."""
     try:
+        # Extract post ID from URL
+        # Example: https://www.reddit.com/r/subreddit/comments/abc123/title/ -> abc123
+        import re
+
+        post_id_match = re.search(r"/comments/([a-zA-Z0-9]+)/", reddit_url)
+        post_id = post_id_match.group(1) if post_id_match else "unknown"
+
         # Convert Reddit URL to JSON API endpoint
-        if reddit_url.endswith('/'):
-            json_url = reddit_url + '.json'
+        if reddit_url.endswith("/"):
+            json_url = reddit_url + ".json"
         else:
-            json_url = reddit_url + '/.json'
+            json_url = reddit_url + "/.json"
 
         # Make request to Reddit's public JSON API
-        headers = {'User-Agent': 'orpheus-tts-local/1.0'}
+        headers = {"User-Agent": "orpheus-tts-local/1.0"}
         response = requests.get(json_url, headers=headers)
 
         if response.status_code != 200:
-            print(f"Error: Failed to fetch Reddit post (status code: {response.status_code})")
-            return None
+            print(
+                f"Error: Failed to fetch Reddit post (status code: {response.status_code})"
+            )
+            return None, None
 
         data = response.json()
 
         # Extract post data from the JSON response
-        if not data or len(data) == 0 or 'data' not in data[0]:
+        if not data or len(data) == 0 or "data" not in data[0]:
             print("Error: Invalid Reddit API response format")
-            return None
+            return None, None
 
-        post_data = data[0]['data']['children'][0]['data']
-        title = post_data.get('title', '')
-        content = post_data.get('selftext', '')
+        post_data = data[0]["data"]["children"][0]["data"]
+        title = post_data.get("title", "")
+        content = post_data.get("selftext", "")
 
         # Combine title and content
         if content:
-            return f"{title} {content}"
+            full_content = f"{title} {content}"
         else:
-            return title
+            full_content = title
+
+        # Create cache directory
+        cache_dir = ".cache/reddit"
+        os.makedirs(cache_dir, exist_ok=True)
+
+        # Save original content to cache
+        original_file = os.path.join(cache_dir, f"{post_id}_original.txt")
+        try:
+            with open(original_file, "w", encoding="utf-8") as f:
+                f.write(f"URL: {reddit_url}\n")
+                f.write(f"Title: {title}\n")
+                f.write(f"Content: {content}\n")
+                f.write(f"Combined: {full_content}\n")
+                f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            print(f"Cached original Reddit content to: {original_file}")
+        except Exception as e:
+            print(f"Warning: Failed to cache original content: {e}")
+
+        return full_content, post_id
 
     except requests.RequestException as e:
         print(f"Error fetching Reddit post: {e}")
-        return None
+        return None, None
     except (KeyError, IndexError, json.JSONDecodeError) as e:
         print(f"Error parsing Reddit data: {e}")
-        return None
+        return None, None
     except Exception as e:
         print(f"Unexpected error: {e}")
-        return None
+        return None, None
 
 
-def split_text_into_chunks(text, chunk_size=DEFAULT_CHUNK_SIZE):
+def preprocess_text(
+    text: str,
+    skip_preprocessing: bool = False,
+    preprocessing_model: str = "openai/gpt-oss-20b",
+    cache_key: Optional[str] = None,
+    source_type: str = "text",
+) -> str:
+    """
+    Preprocess text to expand abbreviations and censor inappropriate words.
+    Uses OpenAI SDK for cleaner response parsing.
+
+    Args:
+        text (str): The input text to preprocess
+        skip_preprocessing (bool): If True, return original text without processing
+        preprocessing_model (str, optional): Override model name for preprocessing
+        cache_key (str, optional): Key for caching (e.g., post_id, filename)
+        source_type (str): Type of source ('reddit', 'file', 'text')
+
+    Returns:
+        str: Processed text with expanded abbreviations and censored words
+    """
+    if skip_preprocessing or not ENABLE_PREPROCESSING:
+        return text
+
+    try:
+        # Use provided values or fall back to environment variables
+        model_name = preprocessing_model or PREPROCESSING_MODEL
+
+        # Initialize OpenAI client with custom base URL for LM Studio
+        client = OpenAI(
+            base_url=API_URL,
+            api_key="not-needed",  # LM Studio doesn't require real API key
+        )
+
+        print("Preprocessing text with LLM...")
+
+        # Create completion using OpenAI SDK
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": PREPROCESSING_SYSTEM_PROMPT},
+                {"role": "user", "content": text},
+            ],
+        )
+
+        processed_text = response.choices[0].message.content
+        if processed_text:
+            processed_text = processed_text.strip()
+
+        if processed_text:
+            # Apply post-processing to catch any shortforms missed by the LLM
+            final_processed_text = post_process_text(processed_text)
+
+            # Save original and processed text using unified cache structure
+            cache_dir = f".cache/{source_type}"
+            os.makedirs(cache_dir, exist_ok=True)
+
+            # Determine file names based on cache_key
+            if cache_key:
+                original_file = os.path.join(cache_dir, f"{cache_key}_original.txt")
+                processed_file = os.path.join(cache_dir, f"{cache_key}_processed.txt")
+            else:
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                original_file = os.path.join(cache_dir, f"{timestamp}_original.txt")
+                processed_file = os.path.join(cache_dir, f"{timestamp}_processed.txt")
+
+            try:
+                # Only save original if it doesn't already exist (for Reddit, it might already be saved)
+                if not os.path.exists(original_file):
+                    with open(original_file, "w", encoding="utf-8") as f:
+                        f.write(text)
+                    print(f"Original text saved to: {original_file}")
+
+                with open(processed_file, "w", encoding="utf-8") as f:
+                    f.write(format_text_for_cache(final_processed_text))
+                print(f"Processed text saved to: {processed_file}")
+            except Exception as e:
+                print(f"Warning: Failed to save text files: {e}")
+
+            return final_processed_text
+        else:
+            print("Warning: Empty response from preprocessing, applying fallback hardcoded replacements")
+            # Apply hardcoded replacements as fallback
+            fallback_processed_text = post_process_text(text)
+
+            # Save fallback processed text to cache
+            cache_dir = f".cache/{source_type}"
+            os.makedirs(cache_dir, exist_ok=True)
+
+            if cache_key:
+                original_file = os.path.join(cache_dir, f"{cache_key}_original.txt")
+                processed_file = os.path.join(cache_dir, f"{cache_key}_processed_fallback.txt")
+            else:
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                original_file = os.path.join(cache_dir, f"{timestamp}_original.txt")
+                processed_file = os.path.join(cache_dir, f"{timestamp}_processed_fallback.txt")
+
+            try:
+                if not os.path.exists(original_file):
+                    with open(original_file, "w", encoding="utf-8") as f:
+                        f.write(text)
+                    print(f"Original text saved to: {original_file}")
+
+                with open(processed_file, "w", encoding="utf-8") as f:
+                    f.write(format_text_for_cache(fallback_processed_text))
+                print(f"Fallback processed text saved to: {processed_file}")
+            except Exception as e:
+                print(f"Warning: Failed to save fallback text files: {e}")
+
+            return fallback_processed_text
+
+    except Exception as e:
+        print(f"Warning: Preprocessing failed with error: {e}")
+        print("Applying fallback hardcoded replacements")
+        # Apply hardcoded replacements as fallback
+        fallback_processed_text = post_process_text(text)
+
+        # Save fallback processed text to cache
+        cache_dir = f".cache/{source_type}"
+        os.makedirs(cache_dir, exist_ok=True)
+
+        if cache_key:
+            original_file = os.path.join(cache_dir, f"{cache_key}_original.txt")
+            processed_file = os.path.join(cache_dir, f"{cache_key}_processed_fallback.txt")
+        else:
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            original_file = os.path.join(cache_dir, f"{timestamp}_original.txt")
+            processed_file = os.path.join(cache_dir, f"{timestamp}_processed_fallback.txt")
+
+        try:
+            if not os.path.exists(original_file):
+                with open(original_file, "w", encoding="utf-8") as f:
+                    f.write(text)
+                print(f"Original text saved to: {original_file}")
+
+            with open(processed_file, "w", encoding="utf-8") as f:
+                f.write(format_text_for_cache(fallback_processed_text))
+            print(f"Fallback processed text saved to: {processed_file}")
+        except Exception as e:
+            print(f"Warning: Failed to save fallback text files: {e}")
+
+        return fallback_processed_text
+
+
+def split_text_into_chunks(
+    text: str, chunk_size: int = DEFAULT_CHUNK_SIZE
+) -> list[str]:
     """Split long text into smaller chunks at sentence boundaries."""
     if len(text) <= chunk_size:
         return [text]
 
-    chunks = []
+    chunks: list[str] = []
     current_chunk = ""
 
     # Split into sentences using regex
-    sentences = re.split(r'(?<=[.!?])\s+', text)
+    sentences = re.split(r"(?<=[.!?])\s+", text)
 
     for sentence in sentences:
         # If adding this sentence would exceed chunk size, start a new chunk
@@ -398,7 +592,7 @@ def split_text_into_chunks(text, chunk_size=DEFAULT_CHUNK_SIZE):
         chunks.append(current_chunk.strip())
 
     # Handle case where a single sentence is longer than chunk_size
-    final_chunks = []
+    final_chunks: list[str] = []
     for chunk in chunks:
         if len(chunk) <= chunk_size:
             final_chunks.append(chunk)
@@ -407,7 +601,10 @@ def split_text_into_chunks(text, chunk_size=DEFAULT_CHUNK_SIZE):
             words = chunk.split()
             current_word_chunk = ""
             for word in words:
-                if current_word_chunk and len(current_word_chunk + " " + word) > chunk_size:
+                if (
+                    current_word_chunk
+                    and len(current_word_chunk + " " + word) > chunk_size
+                ):
                     final_chunks.append(current_word_chunk.strip())
                     current_word_chunk = word
                 else:
@@ -424,7 +621,7 @@ def split_text_into_chunks(text, chunk_size=DEFAULT_CHUNK_SIZE):
 def list_available_voices():
     """List all available voices with the recommended one marked."""
     print("Available voices (in order of conversational realism):")
-    for i, voice in enumerate(AVAILABLE_VOICES):
+    for voice in AVAILABLE_VOICES:
         marker = "★" if voice == DEFAULT_VOICE else " "
         print(f"{marker} {voice}")
     print(f"\nDefault voice: {DEFAULT_VOICE}")
@@ -452,25 +649,20 @@ def main():
         "--list-voices", action="store_true", help="List available voices"
     )
     parser.add_argument(
-        "--temperature",
-        type=float,
-        default=TEMPERATURE,
-        help="Temperature for generation",
-    )
-    parser.add_argument(
-        "--top_p", type=float, default=TOP_P, help="Top-p sampling parameter"
-    )
-    parser.add_argument(
-        "--repetition_penalty",
-        type=float,
-        default=REPETITION_PENALTY,
-        help="Repetition penalty (>=1.1 required for stable generation)",
-    )
-    parser.add_argument(
         "--chunk-size",
         type=int,
         default=DEFAULT_CHUNK_SIZE,
         help=f"Chunk size for processing long texts (default: {DEFAULT_CHUNK_SIZE})",
+    )
+    parser.add_argument(
+        "--skip-preprocessing",
+        action="store_true",
+        help="Skip text preprocessing (abbreviation expansion and censoring)",
+    )
+    parser.add_argument(
+        "--preprocessing-model",
+        type=str,
+        help="Model name for preprocessing (overrides PREPROCESSING_MODEL env var)",
     )
 
     args = parser.parse_args()
@@ -484,18 +676,21 @@ def main():
     provided_sources = [source for source in input_sources if source is not None]
 
     if len(provided_sources) > 1:
-        print("Error: Please provide only one input source (--text, --file, or --reddit)")
+        print(
+            "Error: Please provide only one input source (--text, --file, or --reddit)"
+        )
         return
 
     # Get text from the specified input source
     prompt = None
+    reddit_post_id = None
 
     if args.file:
         prompt = read_text_from_file(args.file)
         if prompt is None:
             return
     elif args.reddit:
-        prompt = get_reddit_post_content(args.reddit)
+        prompt, reddit_post_id = get_reddit_post_content(args.reddit)
         if prompt is None:
             return
     elif args.text:
@@ -505,9 +700,6 @@ def main():
         if len(sys.argv) > 1 and sys.argv[1] not in (
             "--voice",
             "--output",
-            "--temperature",
-            "--top_p",
-            "--repetition_penalty",
             "--file",
             "--reddit",
         ):
@@ -527,15 +719,49 @@ def main():
         output_file = f"outputs/{args.voice}_{timestamp}.wav"
         print(f"No output file specified. Saving to {output_file}")
 
+    # Initialize processed_text
+    processed_text = prompt
+
+    # Preprocess text based on source type
+    if not getattr(args, "skip_preprocessing", False):
+        if reddit_post_id:
+            # For Reddit posts, use post_id as cache key
+            processed_text = preprocess_text(
+                prompt,
+                skip_preprocessing=False,
+                preprocessing_model=getattr(args, "preprocessing_model", None)
+                or PREPROCESSING_MODEL,
+                cache_key=reddit_post_id,
+                source_type="reddit",
+            )
+        elif args.file:
+            # For files, use filename without extension as cache key
+            file_base = os.path.splitext(os.path.basename(args.file))[0]
+            processed_text = preprocess_text(
+                prompt,
+                skip_preprocessing=False,
+                preprocessing_model=getattr(args, "preprocessing_model", None)
+                or PREPROCESSING_MODEL,
+                cache_key=file_base,
+                source_type="file",
+            )
+        else:
+            # For direct text input, no cache key (will use timestamp)
+            processed_text = preprocess_text(
+                prompt,
+                skip_preprocessing=False,
+                preprocessing_model=getattr(args, "preprocessing_model", None)
+                or PREPROCESSING_MODEL,
+                cache_key=None,
+                source_type="text",
+            )
+
     # Generate speech
     start_time = time.time()
-    audio_segments = generate_speech_from_api(
-        prompt=prompt,
+    generate_speech_from_api(
+        prompt=processed_text,
         voice=args.voice,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        repetition_penalty=args.repetition_penalty,
-        chunk_size=getattr(args, 'chunk_size', DEFAULT_CHUNK_SIZE),
+        chunk_size=getattr(args, "chunk_size", DEFAULT_CHUNK_SIZE),
         output_file=output_file,
     )
     end_time = time.time()
