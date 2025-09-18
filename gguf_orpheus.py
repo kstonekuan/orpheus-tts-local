@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 import wave
-from typing import AsyncGenerator, Generator, List, Optional, Tuple, Union
+from typing import AsyncGenerator, Generator, List, Optional, Tuple
 
 import numpy as np
 import requests
@@ -626,6 +626,56 @@ def split_text_into_chunks(
     return final_chunks
 
 
+def load_cached_text(
+    input_source: str, source_type: str, cache_key: Optional[str] = None
+) -> Optional[str]:
+    """
+    Load processed text from cache based on input source and type.
+
+    Args:
+        input_source: The original input (file path, reddit url, or text)
+        source_type: Type of source ('reddit', 'file', 'text')
+        cache_key: Optional explicit cache key (auto-inferred if None)
+
+    Returns:
+        Cached processed text or None if not found
+    """
+    if cache_key is None:
+        # Auto-infer cache key based on source type
+        if source_type == "reddit":
+            # Extract post ID from Reddit URL
+            import re
+            post_id_match = re.search(r"/comments/([a-zA-Z0-9]+)/", input_source)
+            if not post_id_match:
+                print(f"Error: Could not extract post ID from Reddit URL: {input_source}")
+                return None
+            cache_key = post_id_match.group(1)
+        elif source_type == "file":
+            # Use filename without extension as cache key
+            cache_key = os.path.splitext(os.path.basename(input_source))[0]
+        else:  # source_type == "text"
+            print("Error: Cannot use --audio-only with direct text input (no persistent cache key)")
+            return None
+
+    # Construct cache file path
+    cache_dir = f".cache/{source_type}"
+    cache_file = os.path.join(cache_dir, f"{cache_key}_processed.txt")
+
+    # Try to load the cached text
+    try:
+        with open(cache_file, "r", encoding="utf-8") as f:
+            cached_text = f.read().strip()
+        print(f"Loaded cached processed text from: {cache_file}")
+        return cached_text
+    except FileNotFoundError:
+        print(f"Error: Cached processed text not found: {cache_file}")
+        print(f"Run with --text-only first to generate the processed text cache.")
+        return None
+    except Exception as e:
+        print(f"Error reading cached text from {cache_file}: {e}")
+        return None
+
+
 def list_available_voices() -> None:
     """List all available voices with the recommended one marked."""
     print("Available voices (in order of conversational realism):")
@@ -672,11 +722,30 @@ def main() -> None:
         type=str,
         help="Model name for preprocessing (overrides PREPROCESSING_MODEL env var)",
     )
+    parser.add_argument(
+        "--text-only",
+        action="store_true",
+        help="Run only Stage 1 (text preprocessing) and save to cache",
+    )
+    parser.add_argument(
+        "--audio-only",
+        action="store_true",
+        help="Run only Stage 2 (audio generation) using cached processed text",
+    )
 
     args = parser.parse_args()
 
     if args.list_voices:
         list_available_voices()
+        return
+
+    # Validate flags
+    if args.text_only and args.audio_only:
+        print("Error: Cannot specify both --text-only and --audio-only")
+        return
+
+    if args.audio_only and args.text:
+        print("Error: Cannot use --audio-only with --text (direct text input has no persistent cache)")
         return
 
     # Check that only one input source is provided
@@ -717,65 +786,154 @@ def main() -> None:
             if not prompt:
                 prompt = "Hello, I am Orpheus, an AI assistant with emotional speech capabilities."
 
-    # Default output file if none provided
-    output_file = args.output
-    if not output_file:
-        # Create outputs directory if it doesn't exist
-        os.makedirs("outputs", exist_ok=True)
-        # Generate a filename based on the voice and a timestamp
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        output_file = f"outputs/{args.voice}_{timestamp}.wav"
-        print(f"No output file specified. Saving to {output_file}")
-
-    # Initialize processed_text
-    processed_text = prompt
-
-    # Preprocess text based on source type
-    if not getattr(args, "skip_preprocessing", False):
-        if reddit_post_id:
-            # For Reddit posts, use post_id as cache key
-            processed_text = preprocess_text(
-                prompt,
-                skip_preprocessing=False,
-                preprocessing_model=getattr(args, "preprocessing_model", None)
-                or PREPROCESSING_MODEL,
-                cache_key=reddit_post_id,
-                source_type="reddit",
-            )
+    # Handle different modes
+    if args.audio_only:
+        # Mode: Audio generation only from cached text
+        # Determine source type for cache loading
+        if args.reddit:
+            source_type = "reddit"
+            input_source = args.reddit
         elif args.file:
-            # For files, use filename without extension as cache key
-            file_base = os.path.splitext(os.path.basename(args.file))[0]
-            processed_text = preprocess_text(
-                prompt,
-                skip_preprocessing=False,
-                preprocessing_model=getattr(args, "preprocessing_model", None)
-                or PREPROCESSING_MODEL,
-                cache_key=file_base,
-                source_type="file",
-            )
+            source_type = "file"
+            input_source = args.file
         else:
-            # For direct text input, no cache key (will use timestamp)
-            processed_text = preprocess_text(
-                prompt,
-                skip_preprocessing=False,
-                preprocessing_model=getattr(args, "preprocessing_model", None)
-                or PREPROCESSING_MODEL,
-                cache_key=None,
-                source_type="text",
-            )
+            print("Error: --audio-only requires --file or --reddit")
+            return
 
-    # Generate speech
-    start_time = time.time()
-    generate_speech_from_api(
-        prompt=processed_text,
-        voice=args.voice,
-        chunk_size=getattr(args, "chunk_size", DEFAULT_CHUNK_SIZE),
-        output_file=output_file,
-    )
-    end_time = time.time()
+        # Load cached processed text
+        processed_text = load_cached_text(input_source, source_type)
+        if processed_text is None:
+            return
 
-    print(f"Speech generation completed in {end_time - start_time:.2f} seconds")
-    print(f"Audio saved to {output_file}")
+        # Default output file if none provided
+        output_file = args.output
+        if not output_file:
+            # Create outputs directory if it doesn't exist
+            os.makedirs("outputs", exist_ok=True)
+            # Generate a filename based on the voice and a timestamp
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            output_file = f"outputs/{args.voice}_{timestamp}.wav"
+            print(f"No output file specified. Saving to {output_file}")
+
+        # Generate speech
+        print("Generating audio from cached processed text...")
+        start_time = time.time()
+        generate_speech_from_api(
+            prompt=processed_text,
+            voice=args.voice,
+            chunk_size=getattr(args, "chunk_size", DEFAULT_CHUNK_SIZE),
+            output_file=output_file,
+        )
+        end_time = time.time()
+
+        print(f"Speech generation completed in {end_time - start_time:.2f} seconds")
+        print(f"Audio saved to {output_file}")
+
+    elif args.text_only:
+        # Mode: Text preprocessing only (save to cache)
+        # Initialize processed_text
+        processed_text = prompt
+
+        # Preprocess text based on source type
+        if not getattr(args, "skip_preprocessing", False):
+            if reddit_post_id:
+                # For Reddit posts, use post_id as cache key
+                processed_text = preprocess_text(
+                    prompt,
+                    skip_preprocessing=False,
+                    preprocessing_model=getattr(args, "preprocessing_model", None)
+                    or PREPROCESSING_MODEL,
+                    cache_key=reddit_post_id,
+                    source_type="reddit",
+                )
+            elif args.file:
+                # For files, use filename without extension as cache key
+                file_base = os.path.splitext(os.path.basename(args.file))[0]
+                processed_text = preprocess_text(
+                    prompt,
+                    skip_preprocessing=False,
+                    preprocessing_model=getattr(args, "preprocessing_model", None)
+                    or PREPROCESSING_MODEL,
+                    cache_key=file_base,
+                    source_type="file",
+                )
+            else:
+                # For direct text input, no cache key (will use timestamp)
+                processed_text = preprocess_text(
+                    prompt,
+                    skip_preprocessing=False,
+                    preprocessing_model=getattr(args, "preprocessing_model", None)
+                    or PREPROCESSING_MODEL,
+                    cache_key=None,
+                    source_type="text",
+                )
+        else:
+            print("Warning: --skip-preprocessing is set, text will be saved without preprocessing")
+
+        print("Text preprocessing completed. Processed text has been cached.")
+        print("Use --audio-only to generate audio from the cached text.")
+
+    else:
+        # Mode: Both stages (default behavior)
+        # Default output file if none provided
+        output_file = args.output
+        if not output_file:
+            # Create outputs directory if it doesn't exist
+            os.makedirs("outputs", exist_ok=True)
+            # Generate a filename based on the voice and a timestamp
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            output_file = f"outputs/{args.voice}_{timestamp}.wav"
+            print(f"No output file specified. Saving to {output_file}")
+
+        # Initialize processed_text
+        processed_text = prompt
+
+        # Preprocess text based on source type
+        if not getattr(args, "skip_preprocessing", False):
+            if reddit_post_id:
+                # For Reddit posts, use post_id as cache key
+                processed_text = preprocess_text(
+                    prompt,
+                    skip_preprocessing=False,
+                    preprocessing_model=getattr(args, "preprocessing_model", None)
+                    or PREPROCESSING_MODEL,
+                    cache_key=reddit_post_id,
+                    source_type="reddit",
+                )
+            elif args.file:
+                # For files, use filename without extension as cache key
+                file_base = os.path.splitext(os.path.basename(args.file))[0]
+                processed_text = preprocess_text(
+                    prompt,
+                    skip_preprocessing=False,
+                    preprocessing_model=getattr(args, "preprocessing_model", None)
+                    or PREPROCESSING_MODEL,
+                    cache_key=file_base,
+                    source_type="file",
+                )
+            else:
+                # For direct text input, no cache key (will use timestamp)
+                processed_text = preprocess_text(
+                    prompt,
+                    skip_preprocessing=False,
+                    preprocessing_model=getattr(args, "preprocessing_model", None)
+                    or PREPROCESSING_MODEL,
+                    cache_key=None,
+                    source_type="text",
+                )
+
+        # Generate speech
+        start_time = time.time()
+        generate_speech_from_api(
+            prompt=processed_text,
+            voice=args.voice,
+            chunk_size=getattr(args, "chunk_size", DEFAULT_CHUNK_SIZE),
+            output_file=output_file,
+        )
+        end_time = time.time()
+
+        print(f"Speech generation completed in {end_time - start_time:.2f} seconds")
+        print(f"Audio saved to {output_file}")
 
 
 if __name__ == "__main__":
